@@ -16,8 +16,8 @@ KEY_CODE = {
     "Simulations": "S",
 }
 
-SRC = "/mnt/user-data/uploads/shl_product_catalog.json"
-OUT = "/home/claude/shl_agent/data/catalog.json"
+SRC = "shl_product_catalog.json"
+OUT = "data/catalog.json"
 
 
 def main():
