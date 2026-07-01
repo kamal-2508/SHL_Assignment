@@ -1,18 +1,16 @@
 """
-Lightweight retrieval over the SHL Individual Test Solutions catalog.
+Retrieval over the SHL Individual Test Solutions catalog.
 
-Strategy (kept deliberately simple/fast for the 30s per-call budget):
-  1. TF-IDF cosine similarity over name + description + keys + job levels.
-  2. Exact / substring name matching boost (handles short queries like
-     "OPQ", "GSA", "DSI" which TF-IDF alone underweights).
-  3. A small alias table for the most common abbreviations seen in the
-     domain, so "OPQ" reliably surfaces "Occupational Personality
-     Questionnaire OPQ32r", etc.
+Strategy:
+  1. LLM rewrites the conversation into a rich search query (no hardcoded aliases).
+  2. TF-IDF cosine similarity over name + description + keys + job levels.
+  3. Substring boost on name tokens from the LLM-expanded query.
 
-The result is a compact candidate list handed to the LLM as grounding
-context -- the LLM never invents catalog items, it only ever chooses
-from / discusses what retrieval surfaces (plus the conversation history,
-which may reference earlier items already shown by name).
+The LLM query rewrite is the key upgrade: instead of a hardcoded alias table,
+we ask the model to expand abbreviations and extract intent from the full
+conversation naturally. "OPQ" becomes "Occupational Personality Questionnaire
+personality behavior workplace" automatically, without us having to anticipate
+every possible abbreviation.
 """
 import json
 import re
@@ -23,20 +21,6 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 DATA_PATH = Path(__file__).resolve().parent.parent / "data" / "catalog.json"
 
-ALIASES = {
-    "opq": "occupational personality questionnaire opq32r",
-    "opq32r": "occupational personality questionnaire opq32r",
-    "gsa": "global skills assessment",
-    "dsi": "dependability and safety instrument",
-    "mq": "motivation questionnaire",
-    "sjt": "situational judgement situational judgment",
-    "jfa": "job focused assessment",
-    "g+": "verify g+ general ability",
-    "verify g+": "shl verify interactive g+",
-    "svar": "svar spoken",
-    "ucf": "universal competency report",
-}
-
 
 class Catalog:
     def __init__(self, path: Path = DATA_PATH):
@@ -46,10 +30,11 @@ class Catalog:
 
     def _doc_text(self, it):
         parts = [
-            it["name"], it["name"],  # weight name higher
+            it["name"], it["name"],  # name weighted twice
             it.get("description", ""),
             " ".join(it.get("keys_full", [])),
             " ".join(it.get("job_levels", [])),
+            " ".join(it.get("languages", [])),
         ]
         return " ".join(p for p in parts if p)
 
@@ -60,46 +45,32 @@ class Catalog:
         )
         self.matrix = self.vectorizer.fit_transform(self.corpus)
 
-    def _expand_query(self, query: str) -> str:
-        q = query.lower()
-        extra = []
-        for alias, expansion in ALIASES.items():
-            if re.search(r"\b" + re.escape(alias) + r"\b", q):
-                extra.append(expansion)
-        return query + " " + " ".join(extra)
-
-    def search(self, query: str, top_k: int = 25):
+    def search(self, query: str, top_k: int = 30):
         if not query.strip():
             return []
-        expanded = self._expand_query(query)
-        qvec = self.vectorizer.transform([expanded])
+
+        qvec = self.vectorizer.transform([query])
         sims = cosine_similarity(qvec, self.matrix)[0]
 
-        # substring / alias boost on name
-        q_lower = query.lower()
-        tokens = set(re.findall(r"[a-z0-9\+\.]+", q_lower))
-        for alias in ALIASES:
-            if alias in q_lower:
-                tokens.add(alias)
-
+        # substring boost: any token from the query that appears
+        # literally in an item name gets a score bump
+        tokens = set(re.findall(r"[a-z0-9\+\.\#]+", query.lower()))
         boosted = list(sims)
         for i, it in enumerate(self.items):
             name_lower = it["name"].lower()
-            if any(tok and len(tok) >= 2 and tok in name_lower for tok in tokens):
-                boosted[i] += 0.5
+            if any(len(tok) >= 2 and tok in name_lower for tok in tokens):
+                boosted[i] += 0.4
 
-        ranked = sorted(range(len(self.items)), key=lambda i: boosted[i], reverse=True)
-        results = [self.items[i] for i in ranked[:top_k] if boosted[i] > 0]
-        return results
+        ranked = sorted(
+            range(len(self.items)), key=lambda i: boosted[i], reverse=True
+        )
+        return [self.items[i] for i in ranked[:top_k] if boosted[i] > 0]
 
     def get_by_name(self, name_fragment: str):
-        """Direct case-insensitive substring lookup, used to force-include
-        items explicitly named by the user (e.g. for comparisons)."""
         frag = name_fragment.lower()
         return [it for it in self.items if frag in it["name"].lower()]
 
     def validate_urls(self, urls):
-        """Returns the subset of urls that exist in the catalog."""
         valid = {it["url"] for it in self.items}
         return [u for u in urls if u in valid]
 
